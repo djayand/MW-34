@@ -1,266 +1,211 @@
-import threading
 import time
-import tkinter as tk
-from tkinter import ttk
-
-import pyautogui
+import json
+import threading
+import ctypes
 from pynput import mouse, keyboard
-from screeninfo import get_monitors
 
-# Sécurité PyAutoGUI : laisse activé le fail-safe.
-# Si tu envoies la souris dans un coin de l'écran principal,
-# PyAutoGUI lèvera une exception et stoppera l'action.
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.02
+# =========================
+# CONFIG
+# =========================
 
+OUTPUT_FILE = "recording.txt"
 
-class ClickRecorderApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Macro clics")
-        self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)
+# =========================
+# LOW LEVEL SENDINPUT
+# =========================
 
-        # État
-        self.record_armed = False          # F8 appuyé, en attente du 1er clic
-        self.is_recording = False          # enregistrement réellement lancé
-        self.is_replaying = False          # replay en cours
-        self.ignore_mouse_events = False   # pour ne pas réenregistrer pendant replay
-        self.events = []                   # liste des clics enregistrés
-        self.start_time = None             # démarrage réel au 1er clic
-        self.last_recorded_time = None
+PUL = ctypes.POINTER(ctypes.c_ulong)
 
-        # Interface
-        self.status_var = tk.StringVar(value="Prêt")
-        self.count_var = tk.StringVar(value="0 clic enregistré")
-        self.hotkeys_var = tk.StringVar(
-            value="F8 = armer | F9 = stop | F10 = replay"
-        )
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL),
+    ]
 
-        self.build_ui()
-        self.place_on_primary_monitor()
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("mi", MOUSEINPUT),
+    ]
 
-        # Listeners
-        self.mouse_listener = mouse.Listener(on_click=self.on_click)
-        self.keyboard_listener = keyboard.Listener(on_press=self.on_key_press)
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_XDOWN = 0x0080
+MOUSEEVENTF_XUP = 0x0100
 
-        self.mouse_listener.start()
-        self.keyboard_listener.start()
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+def send_mouse_event(x, y, flags, data=0):
+    screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+    screen_height = ctypes.windll.user32.GetSystemMetrics(1)
 
-        # Boucle de maintien sur écran principal / topmost
-        self.keep_on_primary_monitor()
+    abs_x = int(x * 65535 / screen_width)
+    abs_y = int(y * 65535 / screen_height)
 
-    def build_ui(self):
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill="both", expand=True)
+    inp = INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(
+            dx=abs_x,
+            dy=abs_y,
+            mouseData=data,
+            dwFlags=flags | MOUSEEVENTF_ABSOLUTE,
+            time=0,
+            dwExtraInfo=None,
+        ),
+    )
 
-        ttk.Label(frame, text="Enregistreur de parcours de clics").pack(anchor="w")
-        ttk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(8, 0))
-        ttk.Label(frame, textvariable=self.count_var).pack(anchor="w", pady=(4, 0))
-        ttk.Label(frame, textvariable=self.hotkeys_var).pack(anchor="w", pady=(8, 0))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
-        btns = ttk.Frame(frame)
-        btns.pack(fill="x", pady=(12, 0))
+# =========================
+# RECORDER
+# =========================
 
-        ttk.Button(btns, text="Armer (F8)", command=self.arm_recording).pack(
-            side="left", padx=(0, 6)
-        )
-        ttk.Button(btns, text="Stop (F9)", command=self.stop_recording).pack(
-            side="left", padx=(0, 6)
-        )
-        ttk.Button(btns, text="Replay (F10)", command=self.replay_recording).pack(
-            side="left"
-        )
-
-    def get_primary_monitor(self):
-        monitors = get_monitors()
-        primary = next((m for m in monitors if getattr(m, "is_primary", False)), None)
-        return primary if primary else monitors[0]
-
-    def place_on_primary_monitor(self):
-        monitor = self.get_primary_monitor()
-
-        width = 360
-        height = 150
-        x = monitor.x + 20
-        y = monitor.y + 20
-
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-
-    def keep_on_primary_monitor(self):
-        """
-        Réapplique régulièrement la position sur l'écran principal
-        et garde la fenêtre au-dessus.
-        """
-        try:
-            self.place_on_primary_monitor()
-        except Exception:
-            pass
-
-        self.root.after(2000, self.keep_on_primary_monitor)
-
-    def update_status(self, text: str):
-        self.root.after(0, lambda: self.status_var.set(text))
-
-    def update_count(self):
-        text = f"{len(self.events)} clic{'s' if len(self.events) != 1 else ''} enregistré{'s' if len(self.events) != 1 else ''}"
-        self.root.after(0, lambda: self.count_var.set(text))
-
-    def arm_recording(self):
-        if self.is_replaying:
-            self.update_status("Replay en cours, impossible d'armer")
-            return
-
-        self.events.clear()
+class Recorder:
+    def __init__(self):
+        self.recording = False
         self.start_time = None
-        self.last_recorded_time = None
-        self.record_armed = True
-        self.is_recording = False
-        self.update_count()
-        self.update_status("Armé : en attente du 1er clic gauche")
+        self.events = []
 
-    def stop_recording(self):
-        was_recording = self.record_armed or self.is_recording
-        self.record_armed = False
-        self.is_recording = False
+    def start(self):
+        self.events = []
+        self.start_time = time.perf_counter()
+        self.recording = True
+        print("REC START")
 
-        if was_recording:
-            if self.events:
-                self.update_status("Enregistrement stoppé")
-            else:
-                self.update_status("Stop : aucun clic enregistré")
-        else:
-            self.update_status("Rien à stopper")
+    def stop(self):
+        self.recording = False
+        print("REC STOP")
+        self.save()
 
-    def replay_recording(self):
-        if self.is_recording or self.record_armed:
-            self.update_status("Stoppe d'abord l'enregistrement")
-            return
+    def save(self):
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            for e in self.events:
+                f.write(json.dumps(e) + "\n")
+        print(f"Saved {len(self.events)} events")
 
-        if self.is_replaying:
-            self.update_status("Replay déjà en cours")
-            return
-
-        if not self.events:
-            self.update_status("Aucun enregistrement à rejouer")
-            return
-
-        thread = threading.Thread(target=self._replay_worker, daemon=True)
-        thread.start()
-
-    def _replay_worker(self):
-        self.is_replaying = True
-        self.ignore_mouse_events = True
-        self.update_status("Replay en cours...")
-
-        try:
-            # On rejoue selon les délais capturés
-            start = time.perf_counter()
-            for event in self.events:
-                target_t = event["t"]
-                now = time.perf_counter() - start
-                wait_time = target_t - now
-                if wait_time > 0:
-                    time.sleep(wait_time)
-
-                x, y = event["x"], event["y"]
-                button = event["button"]
-
-                pyautogui.moveTo(x, y, duration=0)
-
-                if button == "left":
-                    pyautogui.click(x=x, y=y, button="left")
-                elif button == "right":
-                    pyautogui.click(x=x, y=y, button="right")
-                elif button == "middle":
-                    pyautogui.click(x=x, y=y, button="middle")
-
-            self.update_status("Replay terminé")
-
-        except pyautogui.FailSafeException:
-            self.update_status("Replay arrêté par fail-safe (coin de l'écran)")
-        except Exception as e:
-            self.update_status(f"Erreur replay : {e}")
-        finally:
-            self.is_replaying = False
-            # Petite pause pour éviter de reprendre un faux clic instantané
-            time.sleep(0.2)
-            self.ignore_mouse_events = False
-
-    def on_click(self, x, y, button, pressed):
-        # On n'enregistre que le clic au moment de l'appui
-        if not pressed:
-            return
-
-        if self.ignore_mouse_events or self.is_replaying:
-            return
-
-        # On ne garde que les clics souris
-        if button == mouse.Button.left:
-            btn_name = "left"
-        elif button == mouse.Button.right:
-            btn_name = "right"
-        elif button == mouse.Button.middle:
-            btn_name = "middle"
-        else:
-            return
-
-        # Si armé, le tout premier clic déclenche le vrai départ
-        if self.record_armed and not self.is_recording:
-            self.is_recording = True
-            self.record_armed = False
-            self.start_time = time.perf_counter()
-            self.last_recorded_time = self.start_time
-            self.update_status(f"Enregistrement lancé au 1er clic : ({x}, {y})")
-
-        if not self.is_recording:
+    def record_move(self, x, y):
+        if not self.recording:
             return
 
         t = time.perf_counter() - self.start_time
         self.events.append({
+            "type": "move",
             "t": t,
-            "x": int(x),
-            "y": int(y),
-            "button": btn_name,
+            "x": x,
+            "y": y
         })
-        self.update_count()
 
-    def on_key_press(self, key):
-        try:
-            if key == keyboard.Key.f8:
-                self.arm_recording()
-            elif key == keyboard.Key.f9:
-                self.stop_recording()
-            elif key == keyboard.Key.f10:
-                self.replay_recording()
-        except Exception as e:
-            self.update_status(f"Erreur clavier : {e}")
+    def record_click(self, x, y, button, pressed):
+        if not self.recording:
+            return
 
-    def on_close(self):
-        try:
-            if self.mouse_listener:
-                self.mouse_listener.stop()
-        except Exception:
-            pass
+        t = time.perf_counter() - self.start_time
 
-        try:
-            if self.keyboard_listener:
-                self.keyboard_listener.stop()
-        except Exception:
-            pass
+        btn = str(button)
 
-        self.root.destroy()
+        self.events.append({
+            "type": "click",
+            "t": t,
+            "x": x,
+            "y": y,
+            "button": btn,
+            "pressed": pressed
+        })
 
+# =========================
+# PLAYER
+# =========================
 
-def main():
-    root = tk.Tk()
-    app = ClickRecorderApp(root)
-    root.mainloop()
+class Player:
+    def __init__(self, file):
+        self.file = file
+        self.events = self.load()
 
+    def load(self):
+        events = []
+        with open(self.file, "r", encoding="utf-8") as f:
+            for line in f:
+                events.append(json.loads(line))
+        return events
 
-if __name__ == "__main__":
-    main()
+    def play(self):
+        print("PLAY START")
+        start = time.perf_counter()
+
+        for e in self.events:
+            while time.perf_counter() - start < e["t"]:
+                pass
+
+            if e["type"] == "move":
+                send_mouse_event(e["x"], e["y"], MOUSEEVENTF_MOVE)
+
+            elif e["type"] == "click":
+                btn = e["button"]
+
+                if "left" in btn:
+                    flag = MOUSEEVENTF_LEFTDOWN if e["pressed"] else MOUSEEVENTF_LEFTUP
+                    send_mouse_event(e["x"], e["y"], flag)
+
+                elif "right" in btn:
+                    flag = MOUSEEVENTF_RIGHTDOWN if e["pressed"] else MOUSEEVENTF_RIGHTUP
+                    send_mouse_event(e["x"], e["y"], flag)
+
+                elif "middle" in btn:
+                    flag = MOUSEEVENTF_MIDDLEDOWN if e["pressed"] else MOUSEEVENTF_MIDDLEUP
+                    send_mouse_event(e["x"], e["y"], flag)
+
+                elif "x1" in btn:
+                    flag = MOUSEEVENTF_XDOWN if e["pressed"] else MOUSEEVENTF_XUP
+                    send_mouse_event(e["x"], e["y"], flag, XBUTTON1)
+
+                elif "x2" in btn:
+                    flag = MOUSEEVENTF_XDOWN if e["pressed"] else MOUSEEVENTF_XUP
+                    send_mouse_event(e["x"], e["y"], flag, XBUTTON2)
+
+        print("PLAY END")
+
+# =========================
+# GLOBAL CONTROL
+# =========================
+
+rec = Recorder()
+
+def on_move(x, y):
+    rec.record_move(x, y)
+
+def on_click(x, y, button, pressed):
+    rec.record_click(x, y, button, pressed)
+
+def on_key(key):
+    global rec
+
+    if key == keyboard.Key.f8:
+        rec.start()
+
+    elif key == keyboard.Key.f9:
+        rec.stop()
+
+    elif key == keyboard.Key.f10:
+        Player(OUTPUT_FILE).play()
+
+# =========================
+
+mouse.Listener(on_move=on_move, on_click=on_click).start()
+keyboard.Listener(on_press=on_key).start()
+
+print("F8 = record | F9 = stop | F10 = play")
+
+while True:
+    time.sleep(1)
